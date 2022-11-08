@@ -1,0 +1,318 @@
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "This is the template for creating a solution to analyze Amazon Connect ctr logs using Amazon Athena as described in the blog"
+Parameters:
+    ProjectName:
+        Type: "String"
+        Default: "test123"
+        Description: Enter an all-lowercase single-word name which is between 3 and 56 chars long. An S3 bucket will be created with this name to store all collected data.  
+        MinLength : 3
+        MaxLength : 42
+        AllowedPattern : "^[a-z0-9]*$"
+    CreateANewGlueDatabaseAndS3BucketForTheProject:
+        Type: "String"
+        Default: "Create a new AWS Glue database and Amazon S3 data collection bucket for this project"
+        AllowedValues:
+          - "Create a new AWS Glue database and Amazon S3 data collection bucket for this project"
+          - "Use existing AWS Glue database and Amazon S3 data collection bucket created for this project"
+        Description: Choose whether to create a AWS Glue database and an Amazon S3 bucket for this project. If there is an existing bucket named '{ProjectName}' and a database named '{ProjectName}', then choose to reuse them. 
+
+Conditions:
+    CreateCommonGlueDatabaseAndDestinationBucket: !Equals 
+        - !Ref CreateANewGlueDatabaseAndS3BucketForTheProject
+        - "Create a new AWS Glue database and Amazon S3 data collection bucket for this project"
+        
+Resources:
+
+    DataDestinationBucket:
+        Type: "AWS::S3::Bucket"
+        Condition: CreateCommonGlueDatabaseAndDestinationBucket
+        DeletionPolicy: Retain
+        Properties:
+            BucketName: !Sub "${ProjectName}"
+
+    GlueDatabase:
+        Type: "AWS::Glue::Database"
+        Condition: CreateCommonGlueDatabaseAndDestinationBucket
+        DependsOn: DataDestinationBucket
+        DeletionPolicy: Retain
+        Properties:
+            DatabaseInput:
+                Name: !Sub "${ProjectName}"
+            CatalogId: !Ref "AWS::AccountId"
+
+    DbAndBucketCreationWaitHandle: 
+        Condition: CreateCommonGlueDatabaseAndDestinationBucket
+        DependsOn: GlueDatabase 
+        Type: "AWS::CloudFormation::WaitConditionHandle"
+
+    WaitHandle: 
+        Type: "AWS::CloudFormation::WaitConditionHandle"
+
+    DbAndBucketWaitCondition: 
+        Type: "AWS::CloudFormation::WaitCondition"
+        Properties: 
+            Handle: !If [CreateCommonGlueDatabaseAndDestinationBucket, !Ref DbAndBucketCreationWaitHandle, !Ref WaitHandle]
+            Timeout: "1"
+            Count: 0
+
+
+    KinesisFirehoseServiceRoleForCtr:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/service-role/"
+            RoleName: !Sub "${ProjectName}-KFH-Ctr"
+            AssumeRolePolicyDocument: !Sub |
+                {
+                    "Version":"2012-10-17",
+                    "Statement":[
+                        {
+                            "Effect":"Allow",
+                            "Principal":{"Service":"firehose.amazonaws.com"},
+                            "Action":"sts:AssumeRole"
+                        }
+                    ]
+                }
+            MaxSessionDuration: 3600
+            ManagedPolicyArns:
+              - !Ref KinesisFirehoseServicePolicyForCtr
+
+    KinesisFirehoseServicePolicyForCtr:
+        Type: "AWS::IAM::ManagedPolicy"
+        DependsOn: GlueTableForCtr
+        Properties:
+            ManagedPolicyName: !Sub "${ProjectName}-KFH-Ctr"
+            Path: "/service-role/"
+            PolicyDocument: !Sub |
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "",
+                            "Effect": "Allow",
+                            "Action": [
+                                "glue:GetTable",
+                                "glue:GetTableVersion",
+                                "glue:GetTableVersions"
+                            ],
+                            "Resource": [
+                                "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog",
+                                "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${ProjectName}",
+                                "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}/connect_ctr"
+                            ]
+                        },
+                        {
+                            "Sid": "",
+                            "Effect": "Allow",
+                            "Action": [
+                                "s3:AbortMultipartUpload",
+                                "s3:GetBucketLocation",
+                                "s3:GetObject",
+                                "s3:ListBucket",
+                                "s3:ListBucketMultipartUploads",
+                                "s3:PutObject"
+                            ],
+                            "Resource": [
+                                "arn:aws:s3:::${ProjectName}",
+                                "arn:aws:s3:::${ProjectName}/*"
+                            ]
+                        },
+                        {
+                            "Sid": "",
+                            "Effect": "Allow",
+                            "Action": [
+                                "logs:PutLogEvents"
+                            ],
+                            "Resource": [
+                                "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${ProjectName}-ctr:log-stream:*"
+                            ]
+                        },
+                        {
+                            "Sid": "",
+                            "Effect": "Allow",
+                            "Action": [
+                                "kinesis:DescribeStream",
+                                "kinesis:GetShardIterator",
+                                "kinesis:GetRecords",
+                                "kinesis:ListShards"
+                            ],
+                            "Resource": "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${ProjectName}-Ctr"
+                        }
+                    ]
+                }
+
+    KinesisFirehoseDeliveryStreamForCtrDirectPut:
+        Type: "AWS::KinesisFirehose::DeliveryStream"
+        DependsOn: 
+            - GlueTableForCtr
+        Properties:
+            DeliveryStreamName: !Sub "${ProjectName}-Ctr"
+            DeliveryStreamType: "DirectPut"
+            ExtendedS3DestinationConfiguration:
+                BucketARN: !Sub "arn:aws:s3:::${ProjectName}"
+                BufferingHints:
+                    SizeInMBs: 128
+                    IntervalInSeconds: 60
+                CloudWatchLoggingOptions:
+                    Enabled: true
+                    LogGroupName: !Sub "/aws/kinesisfirehose/${ProjectName}"
+                    LogStreamName: "S3Delivery"
+                CompressionFormat: "UNCOMPRESSED"
+                DataFormatConversionConfiguration:
+                    SchemaConfiguration:
+                        RoleARN: !GetAtt KinesisFirehoseServiceRoleForCtr.Arn
+                        DatabaseName: !Sub "${ProjectName}"
+                        TableName: "connect_ctr"
+                        Region: !Ref AWS::Region
+                        VersionId: "LATEST"
+                    InputFormatConfiguration:
+                        Deserializer:
+                            OpenXJsonSerDe: {}
+                    OutputFormatConfiguration:
+                        Serializer:
+                            ParquetSerDe: {}
+                    Enabled: true
+                EncryptionConfiguration:
+                    NoEncryptionConfig: "NoEncryption"
+                Prefix: "ctr-base/year=!{timestamp:YYYY}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+                ErrorOutputPrefix: "ctr-erroroutputbase/!{timestamp:yyy/MM/dd}/!{firehose:random-string}/!{firehose:error-output-type}/"
+                RoleARN: !GetAtt KinesisFirehoseServiceRoleForCtr.Arn
+                ProcessingConfiguration:
+                    Enabled: false
+                S3BackupMode: "Disabled"
+
+
+    GlueTableForCtr:
+        Type: "AWS::Glue::Table"
+        DependsOn: "DbAndBucketWaitCondition"
+        Properties:
+            DatabaseName: !Sub "${ProjectName}"
+            CatalogId: !Ref "AWS::AccountId"
+            TableInput:
+                Owner: "hadoop"
+                TableType: "EXTERNAL_TABLE"
+                Parameters:
+                    EXTERNAL: "TRUE"
+                    "parquet.compression": "SNAPPY"
+                    "projection.year.type": "integer"
+                    "projection.year.range": "2022,2024"
+                    "projection.month.type": "integer"
+                    "projection.month.range": "01,12"
+                    "projection.month.digits": "2"
+                    "projection.day.type": "integer"
+                    "projection.day.range": "01,31"
+                    "projection.day.digits": "2"
+                    "projection.enabled": "true"
+                    transient_lastDdlTime: "1628108573"
+                StorageDescriptor:
+                    Columns:
+                      -
+                        Name: "awsaccountid"
+                        Type: "string"
+                      -
+                        Name: "awscontacttracerecordformatversion"
+                        Type: "string"
+                      -
+                        Name: "agent"
+                        Type: "struct<arn:string,aftercontactworkduration:int,aftercontactworkendtimestamp:string,aftercontactworkstarttimestamp:string,agentinteractionduration:int,connectedtoagenttimestamp:string,customerholdduration:int,hierarchygroups:string,longestholdduration:int,numberofholds:int,routingprofile:struct<arn:string,name:string>,username:string>"
+                      -
+                        Name: "agentconnectionattempts"
+                        Type: "int"
+                      -
+                        Name: "attributes"
+                        Type: "string"
+                      -
+                        Name: "campaign"
+                        Type: "struct<campaignid:string>"
+                      -
+                        Name: "channel"
+                        Type: "string"
+                      -
+                        Name: "connectedtosystemtimestamp"
+                        Type: "string"
+                      -
+                        Name: "contactid"
+                        Type: "string"
+                      -
+                        Name: "customerendpoint"
+                        Type: "struct<address:string,type:string>"
+                      -
+                        Name: "disconnectreason"
+                        Type: "string"
+                      -
+                        Name: "disconnecttimestamp"
+                        Type: "string"
+                      -
+                        Name: "initialcontactid"
+                        Type: "string"
+                      -
+                        Name: "initiationmethod"
+                        Type: "string"
+                      -
+                        Name: "initiationtimestamp"
+                        Type: "string"
+                      -
+                        Name: "instancearn"
+                        Type: "string"
+                      -
+                        Name: "lastupdatetimestamp"
+                        Type: "string"
+                      -
+                        Name: "mediastreams"
+                        Type: "array<struct<type:string>>"
+                      -
+                        Name: "nextcontactid"
+                        Type: "string"
+                      -
+                        Name: "previouscontactid"
+                        Type: "string"
+                      -
+                        Name: "queue"
+                        Type: "struct<arn:string,dequeuetimestamp:string,duration:int,enqueuetimestamp:string,name:string>"
+                      -
+                        Name: "recording"
+                        Type: "struct<deletionreason:string,location:string,status:string,type:string>"
+                      -
+                        Name: "recordings"
+                        Type: "array<struct<deletionreason:string,fragmentstartnumber:string,fragmentstopnumber:string,location:string,mediastreamtype:string,participanttype:string,starttimestamp:string,status:string,stoptimestamp:string,storagetype:string>>"
+                      -
+                        Name: "scheduledtimestamp"
+                        Type: "string"
+                      -
+                        Name: "systemendpoint"
+                        Type: "struct<address:string,type:string>"
+                      -
+                        Name: "transfercompletedtimestamp"
+                        Type: "string"
+                      -
+                        Name: "transferredtoendpoint"
+                        Type: "struct<address:string,type:string>"
+
+                    Location: !Sub "s3://${ProjectName}/ctr-base"
+                    InputFormat: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
+                    OutputFormat: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
+                    Compressed: false
+                    NumberOfBuckets: -1
+                    SerdeInfo:
+                        SerializationLibrary: "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+                        Parameters:
+                            "serialization.format": "1"
+                    Parameters: {}
+                    SkewedInfo:
+                        SkewedColumnValueLocationMaps: {}
+                    StoredAsSubDirectories: false
+                PartitionKeys:
+                  -
+                    Name: "year"
+                    Type: "int"
+                  -
+                    Name: "month"
+                    Type: "int"
+                  -
+                    Name: "day"
+                    Type: "int"
+                Retention: 0
+                Name: "connect_ctr"
+
+
+
